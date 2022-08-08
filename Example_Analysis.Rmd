@@ -1,0 +1,89 @@
+---
+title: "DamID-Analysis"
+author: "jibsch"
+date: "2018-08-27"
+output: workflowr::wflow_html
+---
+
+This example Analysis loads the counts from a file called table.
+The dataset has samples from two groups: An experimental condition "sd" and the Dam control "Dam".
+The two are differntially compared, and peaks called from the signficantly changing sites.
+
+## Load the DamID counts
+
+```{r include=FALSE}
+library(edgeR)
+library(org.Dm.eg.db)
+library(ggplot2)
+library(dplyr)
+```
+```{r}
+counts = read.table(paste(rprojroot::find_rstudio_root_file(),"/table",sep=""), header=T, skip = 1, row.names = "Geneid")
+samples = names(counts)[6:11]
+samples = gsub("align.JV.","",samples)
+samples = gsub(".bam","",samples)
+names(counts)[6:11] = samples
+group = c("Dam", "Sd", "Dam", "Sd", "Sd", "Dam")
+design = model.matrix(~group)
+y = DGEList(counts[,6:11], group = group)
+keep <- rowSums(cpm(y)>=0.5) >= 3
+y = y[keep, ,keep.lib.sizes=FALSE]
+y = calcNormFactors(y)
+y = estimateDisp(y, robust = T, design = design)
+```
+
+## Diagnostic Plots
+```{r}
+plotMDS(y, col=as.numeric(factor(group)))
+plotBCV(y)
+```
+The MDS does not indicate any strong outliers, the first dimension separates the groups nicely.
+
+## Differential Methylation Analysis
+```{r}
+fit = glmFit(y, design = design)
+lrt = glmLRT(fit, coef=2)
+summary(de.Sd <- decideTestsDGE(lrt, lfc = 1))
+```
+
+```{r}
+detags.Sd <- rownames(y)[as.logical(de.Sd)]
+plotSmear(lrt, de.tags=detags.Sd, ylab = "logFC - Scalloped/Dam")
+```
+
+After calling differnital methylation, we write the outputs to files and run the python script
+to call peaks.
+Afterwards, peaks within 2.5kbps of genes are identified using bedtools.
+
+```{r cache = TRUE, include=FALSE}
+setwd(paste(rprojroot::find_rstudio_root_file(),"/output", sep=""))
+lrt$table$significant = de.Sd
+write.table(lrt$table, file='lrt_sd.txt', quote=F)
+write.table(keep, file='keep', quote=F, col.names = FALSE)
+ system2("python", args=c("call_peaks.py", "keep", "lrt_sd.txt", ">", "sd_peaks.txt"))
+peaks = read.table('sd_peaks.txt')
+names(peaks) = c('chr', 's', 'e', "tags", 'pen', 'aveLogFC', 'sig')
+write.table(peaks[(peaks$tags>2 | peaks$pen==1) & peaks$sig>0,], file='sd_peaks_big.bed', quote=FALSE, row.names = FALSE, col.names = FALSE, sep = "\t")
+system2("./bedtools.sh")
+targets = read.table('sd_peaks_big_2.5k.togene')
+```
+
+## Peak Analysis
+
+```{r}
+peaks$big = peaks$tags> 2 | peaks$pen==1
+qplot(e-s, ..density.., data=peaks, geom='density', xlim=c(0,2500), colour=big, xlab="Peak width")
+```
+We're only using the "big" peaks, which are those with more than a couple of tags, or 100% penetration in a 1kbp window.
+As evident from the distribution, this filtering removes many short peaks and retains any longer events.
+
+## Pathway Analysis
+
+Pathway analysis of results can be performed liek this:
+
+```{r}
+keglink = getGeneKEGGLinks(species.KEGG = "dme", convert = TRUE)
+kegnames = getKEGGPathwayNames(species.KEGG = "dme", remove.qualifier = FALSE)
+entrez = mapIds(org.Dm.eg.db, keys=as.character(targets$V11), keytype = "ENSEMBL", column = "ENTREZID")
+topKEGG(keg.sd <- kegga(entrez[!is.na(entrez)], species = "Dm", gene.pathway = keglink, pathway.names = kegnames))
+```
